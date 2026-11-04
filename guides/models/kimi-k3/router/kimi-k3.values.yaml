@@ -1,0 +1,67 @@
+## Kimi-K3 (TPU v7x) guide overrides for the llm-d router.
+## Layer on top of: recipes/router/base.values.yaml
+##
+## Tiered prefix-cache routing, as in the tiered-prefix-cache guide: one prefix index for what
+## each endpoint holds in HBM and one for its host-DRAM tier, scored together with queue depth
+## and KV utilization. Every pod of the LeaderWorkerSet is an endpoint (one data-parallel rank
+## each, vLLM external DP load balancing), so the router places a request on the rank that holds
+## its prefix in HBM or can load it from that rank's host tier.
+router:
+  extraServicePorts:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8081
+
+  epp:
+    pluginsConfigFile: "kimi-k3-plugins.yaml"
+    pluginsCustomConfig:
+      kimi-k3-plugins.yaml: |
+        apiVersion: llm-d.ai/v1
+        kind: EndpointPickerConfig
+        plugins:
+        - type: no-hit-lru-scorer
+          parameters:
+            # Use the HBM index for the cold-request check.
+            prefixMatchInfoProducerName: gpu-prefix-cache-producer
+        - type: approx-prefix-cache-producer
+          name: gpu-prefix-cache-producer
+          parameters:
+            # The engine's KV block: --block-size 256 raised by vLLM so one block holds a KDA
+            # state (1360 tokens at TP=8 with the fp8 KV cache). Check the engine log
+            # ("Setting attention block size to ...") if you change TP or the KV dtype.
+            blockSizeTokens: 1360
+            maxPrefixTokensToMatch: 262144
+        - type: approx-prefix-cache-producer
+          name: cpu-prefix-cache-producer
+          parameters:
+            # autoTune sizes the index from HBM blocks only (llm-d-router#1650); size it for the
+            # host tier instead. At cpu_bytes_to_use = 256 GiB the offloading connector registers
+            # 1644 host blocks of 1360 tokens per rank (~2.2M tokens); scale with the tier size.
+            autoTune: false
+            blockSizeTokens: 1360
+            maxPrefixTokensToMatch: 262144
+            lruCapacityPerServer: 1644
+        - type: queue-scorer
+        - type: kv-cache-utilization-scorer
+        - type: prefix-cache-scorer
+          name: gpu-prefix-cache-scorer
+          parameters:
+            prefixMatchInfoProducerName: gpu-prefix-cache-producer
+        - type: prefix-cache-scorer
+          name: cpu-prefix-cache-scorer
+          parameters:
+            prefixMatchInfoProducerName: cpu-prefix-cache-producer
+        schedulingProfiles:
+        - name: default
+          plugins:
+          - pluginRef: queue-scorer
+          - pluginRef: kv-cache-utilization-scorer
+          - pluginRef: gpu-prefix-cache-scorer
+          - pluginRef: cpu-prefix-cache-scorer
+          - pluginRef: no-hit-lru-scorer
+
+  modelServers:
+    matchLabels:
+      llm-d.ai/guide: "kimi-k3"
+      llm-d.ai/inference-serving: "true"

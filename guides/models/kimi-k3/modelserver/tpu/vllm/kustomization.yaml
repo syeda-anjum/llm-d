@@ -1,0 +1,56 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Kimi-K3 on one tpu7x 2x2x4 slice (4 hosts x 4 chips) per replica, as a LeaderWorkerSet of 4
+# pods. Every pod runs one TP=8 data-parallel rank of a DP=4 x EP=32 engine in vLLM's external
+# load-balancing mode, so every pod serves its own OpenAI API on :8000 and the router sees four
+# endpoints per slice, each with its own HBM prefix cache and host-DRAM KV tier.
+resources:
+  - ../../../../../recipes/modelserver/base/multi-host/default
+
+namePrefix: kimi-k3-tpu-vllm-
+
+components:
+  - ../../../../../recipes/modelserver/components/graceful-shutdown
+  - ../../../../../recipes/modelserver/components/images/torch-tpu-vllm/release
+
+# The kimi_k3 tool-call and reasoning parsers ship in vllm-torchtpu v0.32.0; the shared release
+# component still pins v0.29.0 for the other TPU guides. This also resolves the image placeholder
+# in patch-vllm.yaml, which replaces the container list after the component has run.
+# TODO: drop this override once components/images/torch-tpu-vllm/release moves to >= v0.32.0.
+images:
+  - name: REPLACE_MODEL_SERVER_IMAGE
+    newName: docker.io/vllm/vllm-torchtpu
+    newTag: v0.32.0
+
+labels:
+  - pairs:
+      llm-d.ai/guide: kimi-k3
+      llm-d.ai/model: Kimi-K3
+      llm-d.ai/accelerator-variant: tpu
+      llm-d.ai/accelerator-vendor: google
+      llm-d.ai/backend: torch-tpu
+    includeSelectors: true
+    fields:
+      - group: leaderworkerset.x-k8s.io
+        version: v1
+        kind: LeaderWorkerSet
+        path: metadata/labels
+        create: true
+      - group: leaderworkerset.x-k8s.io
+        version: v1
+        kind: LeaderWorkerSet
+        path: spec/leaderWorkerTemplate/workerTemplate/metadata/labels
+        create: true
+
+patches:
+  # Every pod of the group is the same serving rank, so the group uses one pod template: drop
+  # the base's leaderTemplate and LWS applies workerTemplate to the leader too (worker-index 0).
+  - target:
+      group: leaderworkerset.x-k8s.io
+      version: v1
+      kind: LeaderWorkerSet
+      name: decode
+    patch: |-
+      - op: remove
+        path: /spec/leaderWorkerTemplate/leaderTemplate
+  - path: patch-vllm.yaml

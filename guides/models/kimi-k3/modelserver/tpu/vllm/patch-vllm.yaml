@@ -1,0 +1,211 @@
+# Kimi-K3 (moonshotai/Kimi-K3, MXFP4 experts + FP8 attention, 1.56 TB) on a tpu7x 2x2x4 slice.
+#
+# Geometry: TP=8 x DP=4 x EP=32. Each of the 4 pods owns one host (4 chips = 8 TPU devices) and
+# runs one TP=8 data-parallel rank; experts are sharded over all 32 devices. vLLM's multi-node
+# data parallelism coordinates the ranks over the network (the DP master is the group leader),
+# and --data-parallel-rank puts it in external load-balancing mode: every rank serves its own
+# API on :8000, so the router routes to each rank's prefix cache directly instead of going
+# through vLLM's internal DP balancer, which is not prefix-aware.
+#
+# Tiered KV cache: each rank offloads evicted KV blocks to host DRAM on its own host
+# (TPURaidenOffloadingConnector over TPU Sync, kv_both). cpu_bytes_to_use is per rank, i.e. per
+# pod: 4 x 256 GiB per slice. raiden_controller_port (28800) sits below the host's ephemeral port
+# range (32768-60999) so an outbound socket cannot take it first.
+#
+# Weights: a 2x2x4 node's boot disk is far smaller than the 1.56 TB checkpoint, so every pod
+# mounts the kimi-k3-models ReadOnlyMany Hyperdisk ML volume (hydrated once from a GCS copy of
+# the Hugging Face repo, see the guide) at /models. --enable-ep-weight-filter makes each rank
+# read only the byte ranges of its own experts.
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: decode
+  annotations:
+    # One slice (node pool) per group.
+    leaderworkerset.sigs.k8s.io/exclusive-topology: "cloud.google.com/gke-nodepool"
+spec:
+  replicas: 1
+  # TPU slices are fixed size: a surge group never schedules.
+  rolloutStrategy:
+    type: RollingUpdate
+    rollingUpdateConfiguration:
+      maxSurge: 0
+      maxUnavailable: 1
+  leaderWorkerTemplate:
+    size: 4
+    # The 4 ranks are one engine: if any pod restarts, recreate the whole group.
+    restartPolicy: RecreateGroupOnPodRestart
+    workerTemplate:
+      metadata:
+        labels:
+          llm-d.ai/inference-serving: "true"
+      spec:
+        terminationGracePeriodSeconds: 75
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu7x
+          cloud.google.com/gke-tpu-topology: 2x2x4
+        containers:
+          - name: modelserver
+            image: REPLACE_MODEL_SERVER_IMAGE
+            lifecycle:
+              preStop:
+                exec:
+                  command: ["/bin/sleep", "15"]
+            command: ["/bin/bash", "-c"]
+            args:
+              - |
+                set -euo pipefail
+                # Each rank drives only its host's chips: clear the slice-wide multi-host TPU
+                # environment the GKE TPU webhook injects (DP, not one TP group, spans the hosts).
+                export MEGASCALE_COORDINATOR_ADDRESS= MEGASCALE_NUM_SLICES= MEGASCALE_PORT= \
+                  MEGASCALE_SLICE_ID= TPU_PROCESS_ADDRESSES= TPU_PROCESS_PORT= TPU_WORKER_HOSTNAMES=
+                export VLLM_HOST_IP="${POD_IP}"
+                RANK="${LWS_WORKER_INDEX}"
+                until DP_MASTER=$(getent ahostsv4 "${LWS_LEADER_ADDRESS}" | awk 'NR==1{print $1}') \
+                    && [ -n "${DP_MASTER}" ]; do
+                  echo "Waiting for ${LWS_LEADER_ADDRESS} to resolve..."; sleep 5
+                done
+                exec vllm serve /models/Kimi-K3 \
+                  --served-model-name=moonshotai/Kimi-K3 \
+                  --safetensors-load-strategy=prefetch \
+                  --trust-remote-code \
+                  --host=0.0.0.0 \
+                  --port=8000 \
+                  --tensor-parallel-size=8 \
+                  --data-parallel-size=4 \
+                  --data-parallel-size-local=1 \
+                  --data-parallel-rank="${RANK}" \
+                  --data-parallel-address="${DP_MASTER}" \
+                  --data-parallel-rpc-port=29500 \
+                  --distributed-executor-backend=mp \
+                  --enable-expert-parallel \
+                  --enable-ep-weight-filter \
+                  --attention-backend=CUSTOM \
+                  --language-model-only \
+                  --limit-mm-per-prompt='{"image":0,"video":0}' \
+                  --max-model-len=262144 \
+                  --kv-cache-dtype=fp8 \
+                  --block-size=256 \
+                  --gpu-memory-utilization=0.90 \
+                  --max-num-batched-tokens=1360 \
+                  --max-num-seqs=16 \
+                  --compilation-config='{"compile_sizes":[1,2,4,8,16,1360]}' \
+                  --enable-prefix-caching \
+                  --mamba-cache-mode=align \
+                  --prefix-cache-retention-interval=0 \
+                  --enable-prompt-tokens-details \
+                  --async-scheduling \
+                  --kv-transfer-config='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":274877906944,"raiden_controller_port":28800}}' \
+                  --enable-auto-tool-choice \
+                  --tool-call-parser=kimi_k3 \
+                  --reasoning-parser=kimi_k3 \
+                  --disable-access-log-for-endpoints=/health,/metrics,/v1/models \
+                  --shutdown-timeout=45
+            env:
+              - name: POD_IP
+                valueFrom:
+                  fieldRef:
+                    fieldPath: status.podIP
+              - name: TPU_MULTIHOST_BACKEND
+                value: "mp"
+              # In a pod the metadata server describes the node, not the workload.
+              - name: TPU_SKIP_MDS_QUERY
+                value: "1"
+              - name: PJRT_DEVICE
+                value: "TPU"
+              - name: VLLM_TARGET_DEVICE
+                value: "tpu"
+              # Two cold boots stream the checkpoint and compile; allow for it.
+              - name: VLLM_ENGINE_READY_TIMEOUT_S
+                value: "14400"
+              - name: VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
+                value: "10800"
+              # Boot-time temporary files are tens of GB, more than the node's ephemeral disk.
+              - name: TMPDIR
+                value: /dev/shm
+              # Drop the checkpoint's page cache once weights are in HBM (frees host RAM).
+              - name: TPU_EVICT_WEIGHTS_PAGE_CACHE
+                value: "1"
+              # Kimi-K3 multi-host EP settings validated with this geometry.
+              - name: TPU_MOE_HIERARCHICAL_EP
+                value: "1"
+              - name: TPU_LATENT_PROJ_INTRA_CHIP_TP
+                value: "1"
+              - name: TPU_PARALLEL_PRECOMPILE
+                value: "1"
+              # Unified KV/KDA-state block pool and the TPU Sync host tier.
+              - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                value: "1"
+              - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                value: "1"
+              - name: TPU_PREMAPPED_BUFFER_SIZE
+                value: "17179869184"
+              - name: TPU_KV_SHM_POOL_GB
+                value: "8"
+              - name: RAIDEN_EXPECTED_WORKERS_TIMEOUT_S
+                value: "900"
+              # Prefix-cache block hashes must agree across processes and pods.
+              - name: PYTHONHASHSEED
+                value: "0"
+              - name: TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS
+                value: "false"
+              - name: TORCHINDUCTOR_AUTOGRAD_CACHE
+                value: "0"
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: llm-d-hf-token
+                    key: HF_TOKEN
+                    optional: true
+            ports:
+              - name: modelserver
+                containerPort: 8000
+                protocol: TCP
+            resources:
+              # Whole host. Request = limit reserves the pinned host KV tier (256 GiB), the
+              # weight-loading buffers and /dev/shm, all charged to this container.
+              requests:
+                cpu: "64"
+                memory: 850Gi
+                google.com/tpu: "4"
+              limits:
+                memory: 850Gi
+                google.com/tpu: "4"
+            # A cold start reads ~400 GB per host and compiles (~25 min measured): allow 2 hours.
+            startupProbe:
+              httpGet:
+                path: /health
+                port: modelserver
+              initialDelaySeconds: 60
+              periodSeconds: 30
+              timeoutSeconds: 5
+              failureThreshold: 240
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: modelserver
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            readinessProbe:
+              httpGet:
+                path: /v1/models
+                port: modelserver
+              periodSeconds: 5
+              timeoutSeconds: 2
+              failureThreshold: 3
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /models
+                name: models
+                readOnly: true
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          - name: models
+            persistentVolumeClaim:
+              claimName: kimi-k3-models
+              readOnly: true
