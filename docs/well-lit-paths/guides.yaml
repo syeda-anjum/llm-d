@@ -75,6 +75,10 @@ sections:
         slug: qwen3-5-397b
         title: Qwen3.5-397B
         position: 4
+      - dir: guides/models/gpt-oss-120b
+        slug: gpt-oss-120b
+        title: gpt-oss-120b
+        position: 5
   # Operations: the sidebar is at most two levels deep (Operations > category
   # > page). Two guides are categories themselves (section `operations`,
   # target `operations`) and keep their child pages; the other sections map

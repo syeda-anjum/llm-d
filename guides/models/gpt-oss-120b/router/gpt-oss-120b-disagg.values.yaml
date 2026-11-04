@@ -1,0 +1,91 @@
+## gpt-oss-120b (TPU v7x, SGLang, TOPOLOGY=disaggregated) guide overrides for the llm-d router.
+## Layer on top of: recipes/router/base.values.yaml
+##
+## Same plugin chain as pd-disaggregation.values.yaml, plus the DisaggregatedSet
+## rollout screener (as the other DisaggregatedSet model guides) and the prefix
+## producer sized for SGLang's 64-token pages and HiCache host tier.
+
+router:
+  extraServicePorts:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8081
+
+  epp:
+    # Single EPP replica: the inflight-load-producer's in-flight token accounting
+    # (which the token-load-scorer and affinity filter consume) is local to each
+    # EPP process, so multiple replicas would each see only a fraction of the
+    # per-endpoint load and incorrectly gate the affinity filter.
+    replicas: 1
+    flags:
+      # The disaggregatedset-rollout-screener is Alpha stability.
+      allow-experimental-plugins: true
+    pluginsConfigFile: "pd-config.yaml"
+    pluginsCustomConfig:
+      pd-config.yaml: |
+        apiVersion: llm-d.ai/v1
+        kind: EndpointPickerConfig
+        plugins:
+        # Pin each request to a single DisaggregatedSet revision during
+        # rollouts so prefill and decode never pair across revisions.
+        - type: disaggregatedset-rollout-screener
+          parameters:
+            scope:
+              labelSelector: "disaggregatedset.x-k8s.io/name=pd-disagg-tpu-sglang"
+            revisionGating:
+              mode: max-role
+              requiredRoles: [prefill, decode]
+        - type: always-disagg-pd-decider
+        - type: disagg-profile-handler
+          parameters:
+            deciders:
+              prefill: always-disagg-pd-decider
+        - type: prefill-filter
+        - type: decode-filter
+        - type: approx-prefix-cache-producer
+          parameters:
+            # Matches SGLang's --page-size=64 and --context-length=131072.
+            blockSizeTokens: 64
+            maxPrefixTokensToMatch: 131072
+            # autoTune sizes the LRU from HBM blocks only and ignores the HiCache
+            # host tier (llm-d/llm-d-router#1650); sized for the host tier instead.
+            # Unit: 64-token blocks, from the engine's startup log for one TP rank
+            # (every rank holds the same tokens): HBM full-attention pool 221,632
+            # tokens + HiCache host pool 1,929,728 tokens (32 GB, page_first_fused)
+            # = 2,151,360 tokens / 64.
+            autoTune: false
+            lruCapacityPerServer: 33615
+        - type: inflight-load-producer
+        - type: prefix-cache-affinity-filter
+          parameters:
+            # Measured with guides/recipes/router/calibration/calibrate.sh through
+            # the full P/D path (CHUNK_SIZE=4096, tpu7x 2x2x1, TP=8/EP=8), so it
+            # includes the raiden KV transfer and the sidecar hop. Re-measure for
+            # other hardware/models.
+            peakPrefillThroughput: 17878
+        - type: token-load-scorer
+        - type: active-request-scorer
+        - type: max-score-picker
+        schedulingProfiles:
+        # Prefill does the prompt pass: keep prefix groups on cache-warm pods
+        # (affinity filter) and pick by queued prefill token load.
+        - name: prefill
+          plugins:
+          - pluginRef: prefill-filter
+          - pluginRef: prefix-cache-affinity-filter
+          - pluginRef: token-load-scorer
+          - pluginRef: max-score-picker
+        # Pure decode is bound by concurrent in-flight requests, not prefill
+        # throughput: pick the least-busy endpoint.
+        - name: decode
+          plugins:
+          - pluginRef: decode-filter
+          - pluginRef: active-request-scorer
+          - pluginRef: max-score-picker
+
+  modelServers:
+    # core-metrics-extractor reads SGLang's metric names.
+    type: sglang
+    matchLabels:
+      llm-d.ai/guide: "gpt-oss-120b"

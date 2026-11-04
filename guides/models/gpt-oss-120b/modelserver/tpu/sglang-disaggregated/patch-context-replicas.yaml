@@ -1,0 +1,44 @@
+# gpt-oss-120b overrides on top of the pd-disaggregation SGLang TPU7x base (JSON 6902, so the
+# atomic args/env lists are edited in place instead of copied). The `test` ops make the build
+# fail loudly if the base reorders its args or env, instead of patching the wrong entry.
+#
+# - Serve the model's full 131,072-token context. The base uses --context-length=9236 with
+#   SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1, sized for an 8k-in/1k-out P/D smoke test.
+# - 3 prefill + 1 decode (3P1D): the agentic workload is prefill-heavy (long, mostly cached
+#   contexts, short outputs), and three prefill endpoints give the router a real choice for
+#   prefix-cache affinity.
+# Roles render in decode (0), prefill (1) order.
+- op: test
+  path: /spec/roles/0/name
+  value: decode
+- op: test
+  path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/args/17
+  value: --context-length=9236
+- op: replace
+  path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/args/17
+  value: --context-length=131072
+- op: test
+  path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/6/name
+  value: SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN
+- op: remove
+  path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/6
+- op: replace
+  path: /spec/roles/0/spec/replicas
+  value: 1
+- op: test
+  path: /spec/roles/1/name
+  value: prefill
+- op: test
+  path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/args/17
+  value: --context-length=9236
+- op: replace
+  path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/args/17
+  value: --context-length=131072
+- op: test
+  path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/6/name
+  value: SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN
+- op: remove
+  path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/6
+- op: replace
+  path: /spec/roles/1/spec/replicas
+  value: 3

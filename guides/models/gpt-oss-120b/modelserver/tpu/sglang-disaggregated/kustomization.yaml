@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The SGLang TPU7x P/D overlay of the pd-disaggregation guide, unchanged: gpt-oss-120b
+# TP=8/EP=8 on one 2x2x1 node per role, raiden (tpu-sync) KV transfer and a 32 GB/rank
+# HiCache host-DRAM tier on both roles. See its patch-prefill.yaml / patch-decode.yaml
+# for the engine flags, the raiden port range and the rollout strategy. This guide relabels
+# the pods for its own router, adds graceful shutdown, serves the full 131,072-token context
+# and runs 3 prefill + 1 decode (patch-context-replicas.yaml).
+resources:
+  - ../../../../../pd-disaggregation/modelserver/tpu/v7/sglang/base
+
+components:
+  - ../../../../../recipes/modelserver/components/graceful-shutdown
+
+labels:
+  - pairs:
+      llm-d.ai/guide: gpt-oss-120b
+    fields:
+      - path: spec/roles/spec/leaderWorkerTemplate/workerTemplate/metadata/labels
+        kind: DisaggregatedSet
+        create: true
+
+patches:
+  - path: patch-context-replicas.yaml
+    target:
+      kind: DisaggregatedSet

@@ -10,6 +10,7 @@ self-contained deployment and backs it with benchmark results.
 - **[GLM-5.2](../../../guides/models/glm-5-2/README.md)** *(optimized for agentic workloads)*: `GLM-5.2-FP8` on H200 — wide expert-parallel P/D disaggregation with MTP speculative decoding, dual-tier prefix-cache routing, and CPU+NVMe KV offloading; benchmarked on production agentic traces.
 - **[NVIDIA Nemotron 3 Ultra](../../../guides/models/nemotron-3-ultra/README.md)** *(optimized for agentic workloads)*: `NVIDIA-Nemotron-3-Ultra-550B` on H200 — P/D disaggregation with disaggregation-aware prefix-cache routing and CPU KV offloading, plus ready-to-use coding-agent client configs.
 - **[Qwen3.5-397B](../../../guides/models/qwen3-5-397b/README.md)** *(optimized for agentic workloads)*: `Qwen3.5-397B-A17B-FP8` on TPU 7x with Torch TPU — prefix-aware routing and host-DRAM KV offloading, with a TPU Sync P/D-disaggregated configuration.
+- **[gpt-oss-120b](../../../guides/models/gpt-oss-120b/README.md)** *(optimized for agentic workloads)*: `openai/gpt-oss-120b` on TPU 7x with SGLang on Torch TPU — prefix-aware routing, SGLang HiCache host-DRAM KV offloading, and TPU Sync (`raiden`) P/D disaggregation.
 
 ## Agentic Workloads
 
