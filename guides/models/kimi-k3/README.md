@@ -23,6 +23,12 @@ TPU 7x with vLLM on Torch TPU and the llm-d router. It composes the
   rank its own API server, so the router, not vLLM's prefix-unaware internal DP balancer, decides
   which rank (and therefore which HBM cache and host tier) serves a request.
 
+Set `TOPOLOGY` to pick the serving topology: `unified` (default) runs the pool above on one
+`2x2x4` slice; `disaggregated` runs Kimi-K3 as a prefill/decode pair on the vllm-torchtpu
+**megakernel** backend (Pallas kernels for the whole prefill stack and a fused 93-layer decoder),
+one TP=32 × DCP=32 engine per role on its own `2x2x4` slice, with a host-DRAM KV store on both
+roles and TPU Sync (Raiden) P→D transfer.
+
 ## Default Configuration
 
 | Parameter | Value |
@@ -37,6 +43,7 @@ TPU 7x with vLLM on Torch TPU and the llm-d router. It composes the
 | KV cache offload | `TPURaidenOffloadingConnector`, 256 GiB host tier per DP rank (1 TiB per replica) |
 | Model weights | `ReadOnlyMany` Hyperdisk ML volume hydrated once from a GCS copy of the Hugging Face repo; each rank reads only its own experts |
 | Model server | vLLM on Torch TPU (`docker.io/vllm/vllm-torchtpu:v0.32.0`) |
+| `TOPOLOGY=disaggregated` | 1 prefill + 1 decode LeaderWorkerSet (2 × `2x2x4`), TP=32 × DCP=32 per role, `--load-format megakernel` from a TP32 pre-shard, fp8 KV (512-token pages), 1.5 TiB host KV store per role; image `vllm/vllm-torchtpu:nightly-20261019-k3-megakernel-c78529c` pinned by digest |
 
 ## Supported Accelerators and Model Servers
 
@@ -45,7 +52,7 @@ This guide includes configurations for the following accelerator and model serve
 <!-- guide:support start -->
 | Accelerator | `ACCELERATOR_TYPE` | Served model | vLLM | Notes |
 | --- | --- | --- | --- | --- |
-| Google TPU v7x | `tpu` | `moonshotai/Kimi-K3` | 🟡 community | GKE only · Torch TPU vLLM · 1 LeaderWorkerSet replica on a `tpu7x` `2x2x4` slice (4 hosts × 4 chips): TP=8 × DP=4 × EP=32, one data-parallel rank per host, each serving its own endpoint (vLLM external DP load balancing) · fp8 KV cache, 262k context, 256 GiB host-DRAM KV tier per rank (`TPURaidenOffloadingConnector`) · weights on a ReadOnlyMany Hyperdisk ML volume hydrated from GCS |
+| Google TPU v7x | `tpu` | `moonshotai/Kimi-K3` | 🟡 community | GKE only · Torch TPU vLLM · 1 LeaderWorkerSet replica on a `tpu7x` `2x2x4` slice (4 hosts × 4 chips): TP=8 × DP=4 × EP=32, one data-parallel rank per host, each serving its own endpoint (vLLM external DP load balancing) · fp8 KV cache, 262k context, 256 GiB host-DRAM KV tier per rank (`TPURaidenOffloadingConnector`) · `TOPOLOGY=disaggregated`: megakernel backend P/D, 1 prefill + 1 decode LeaderWorkerSet, each TP=32 × DCP=32 on its own `2x2x4` slice, 1.5 TiB host KV store per role · weights on a ReadOnlyMany Hyperdisk ML volume hydrated from GCS |
 
 ✅ validated: covered by a nightly E2E workflow · 🟡 community: maintained by the hardware vendor or community, not covered by nightly E2E · ❌ not supported: tracked in the linked issue · — no configuration.
 <!-- guide:support end -->
@@ -95,6 +102,7 @@ export MONITORING=false # options: false, true
 export MONITORING_VALUES=
 export ACCELERATOR_TYPE=tpu # options: tpu
 export MODEL_SERVER=vllm # options: vllm
+export TOPOLOGY=unified # options: unified, disaggregated
 export MODEL=moonshotai/Kimi-K3 # the served model name
 export MODEL_BUCKET=my-model-bucket # GCS bucket that holds the moonshotai/Kimi-K3 copy
 source ${REPO_ROOT}/guides/env.sh # defines GAIE_VERSION, ROUTER_CHART_VERSION, router chart URLs, and CURL_TEST_IMAGE
@@ -180,6 +188,20 @@ gcloud storage buckets add-iam-policy-binding gs://${MODEL_BUCKET} \
 <!-- llm-d-cicd:skip end -->
 <!-- guide:prerequisites.model_storage_access end -->
 
+For `TOPOLOGY=disaggregated`, also write the megakernel's TP32 pre-shard (~1.7 TB: the
+kernel-layout weights and the prefill's sequence-parallel cache) next to the checkpoint, once,
+before you create the volume. It runs on CPU in the megakernel image (any host with the
+checkpoint and ~2 TB of free disk):
+
+```bash
+# only when TOPOLOGY=disaggregated:
+docker run --rm -v "$PWD:/models" -e MEGAKERNEL_TOOL_WORKER=1 \
+  docker.io/vllm/vllm-torchtpu@sha256:c86637bddf84176f91154df5109f6f36d9bdfb59155ee7796cf9686eb2795945 bash -c '
+  python -m tools.megakernel preshard k3 --checkpoint /models/Kimi-K3 --output /models/kimi-k3-tp32 --ranks $(seq -s, 0 31) &&
+  python -m tools.megakernel preshard prefill --checkpoint /models/Kimi-K3 --output /models/kimi-k3-tp32'
+gcloud storage cp -r ./kimi-k3-tp32 gs://${MODEL_BUCKET}/moonshotai/
+```
+
 **Create the StorageClass, data source and PVC.** The PVC is sized for the checkpoint plus the
 megakernel pre-shard that `TOPOLOGY=disaggregated` reads (see below), and hydrates when the first
 pod that mounts it is scheduled:
@@ -235,12 +257,34 @@ EOF
 
 **Prepare the paths to the `helm` values files** for the `llm-d` router:
 
-<!-- guide:deploy.router_values start -->
+<!-- tabs:start group=topology -->
+<details open>
+<summary><b>Unified (Default)</b></summary>
+
+<!-- guide:deploy.router_values.unified start -->
 ```bash
+# only when TOPOLOGY=unified:
 export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
 export ROUTER_VALUES="${REPO_ROOT}/guides/models/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml"
 ```
-<!-- guide:deploy.router_values end -->
+<!-- guide:deploy.router_values.unified end -->
+
+</details>
+<details>
+<summary><b>Disaggregated (megakernel)</b></summary>
+
+<!-- guide:deploy.router_values.disaggregated start -->
+<!-- llm-d-cicd:skip start -->
+```bash
+# only when TOPOLOGY=disaggregated:
+export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
+export ROUTER_VALUES="${REPO_ROOT}/guides/models/${GUIDE_NAME}/router/${GUIDE_NAME}-disagg.values.yaml"
+```
+<!-- llm-d-cicd:skip end -->
+<!-- guide:deploy.router_values.disaggregated end -->
+
+</details>
+<!-- tabs:end -->
 
 **(Optional) Enable Prometheus monitoring on the `llm-d` router** by defining the `helm` values file (requires installing the monitoring stack mentioned in [Prerequisites](#prerequisites)):
 
@@ -274,18 +318,43 @@ helm install ${GUIDE_NAME} \
 
 **Apply the Kustomize overlay:**
 
-<!-- guide:deploy.modelserver start -->
+<!-- tabs:start group=topology -->
+<details open>
+<summary><b>Unified (Default)</b></summary>
+
+<!-- guide:deploy.modelserver.unified start -->
 ```bash
+# only when TOPOLOGY=unified:
 kubectl apply -n ${NAMESPACE} \
   -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/
 ```
-<!-- guide:deploy.modelserver end -->
+<!-- guide:deploy.modelserver.unified end -->
+
+</details>
+<details>
+<summary><b>Disaggregated (megakernel)</b></summary>
+
+<!-- guide:deploy.modelserver.disaggregated start -->
+<!-- llm-d-cicd:skip start -->
+```bash
+# only when TOPOLOGY=disaggregated:
+kubectl apply -n ${NAMESPACE} \
+  -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}-disaggregated/
+```
+<!-- llm-d-cicd:skip end -->
+<!-- guide:deploy.modelserver.disaggregated end -->
+
+</details>
+<!-- tabs:end -->
 
 Wait for the model server to become ready. The first start also hydrates the model volume; a
 cold start then reads about 400 GB per host and compiles; budget about 30 minutes (weights ~3 min, compilation ~15 min, engine and host-tier start-up):
 
 ```bash
+# TOPOLOGY=unified
 kubectl wait --for=condition=Available leaderworkerset/kimi-k3-tpu-vllm-decode -n ${NAMESPACE} --timeout=7200s
+# TOPOLOGY=disaggregated
+kubectl wait --for=condition=Available leaderworkerset/kimi-k3-tpu-vllm-prefill leaderworkerset/kimi-k3-tpu-vllm-decode -n ${NAMESPACE} --timeout=7200s
 ```
 
 **(Optional) Deploy the monitoring resources for model servers** (requires installing the monitoring stack mentioned in [Prerequisites](#prerequisites)):
@@ -379,11 +448,32 @@ digest and benchmark parameters of each run.
 
 To remove the deployed components:
 
-<!-- guide:cleanup.modelserver start -->
+<!-- tabs:start group=topology -->
+<details open>
+<summary><b>Unified (Default)</b></summary>
+
+<!-- guide:cleanup.modelserver.unified start -->
 ```bash
+# only when TOPOLOGY=unified:
 kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/
 ```
-<!-- guide:cleanup.modelserver end -->
+<!-- guide:cleanup.modelserver.unified end -->
+
+</details>
+<details>
+<summary><b>Disaggregated (megakernel)</b></summary>
+
+<!-- guide:cleanup.modelserver.disaggregated start -->
+<!-- llm-d-cicd:skip start -->
+```bash
+# only when TOPOLOGY=disaggregated:
+kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}-disaggregated/
+```
+<!-- llm-d-cicd:skip end -->
+<!-- guide:cleanup.modelserver.disaggregated end -->
+
+</details>
+<!-- tabs:end -->
 
 <!-- guide:cleanup.rest start -->
 ```bash

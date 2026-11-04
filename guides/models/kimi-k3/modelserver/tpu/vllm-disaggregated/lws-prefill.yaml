@@ -1,0 +1,109 @@
+# Kimi-K3 P/D on the megakernel backend: one prefill and one decode LeaderWorkerSet, each a group
+# of 4 pods on its own tpu7x 2x2x4 slice. serve-megakernel.sh (ConfigMap megakernel)
+# launches each pod as node rank LWS_WORKER_INDEX of the role's TP=32 x DCP=32 engine. Only the
+# leaders (worker-index 0) serve HTTP and carry llm-d.ai/inference-serving, so the router never
+# targets a headless rank.
+#
+# Two plain LeaderWorkerSets rather than a DisaggregatedSet: they run on any LWS release and each
+# role is already a multi-host group. Scale out by raising a role's replicas (one slice each).
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: prefill
+  labels:
+    llm-d.ai/role: prefill
+  annotations:
+    leaderworkerset.sigs.k8s.io/exclusive-topology: "cloud.google.com/gke-nodepool"
+spec:
+  replicas: 1
+  rolloutStrategy:
+    type: RollingUpdate
+    rollingUpdateConfiguration: {maxSurge: 0, maxUnavailable: 1}
+  leaderWorkerTemplate:
+    size: 4
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          llm-d.ai/role: prefill
+          llm-d.ai/inference-serving: "true"
+      spec:
+        serviceAccountName: sa
+        terminationGracePeriodSeconds: 75
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu7x
+          cloud.google.com/gke-tpu-topology: 2x2x4
+        containers:
+          - name: modelserver
+            image: REPLACE_MODEL_SERVER_IMAGE
+            command: ["/bin/bash", "/opt/kimi-k3/serve-megakernel.sh"]
+            lifecycle:
+              preStop:
+                exec:
+                  command: ["/bin/sleep", "15"]
+            env: &prefill-env
+              - {name: ROLE, value: prefill}
+              # 1.5 TiB host KV store split over the role's 32 ranks (384 GiB per host).
+              - {name: HOST_KV_BYTES, value: "1649267441664"}
+              - {name: OFFLOAD_CONTROLLER_PORT, value: "27800"}
+              - {name: MAX_NUM_SEQS, value: "4"}
+              # The prefill stack's MoE reduction precision.
+              - {name: TPU_K3_MOE_REDUCE_DTYPE, value: bfloat16}
+              - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+            envFrom: &common-env
+              - configMapRef:
+                  name: megakernel-env
+            ports:
+              - {name: modelserver, containerPort: 8000, protocol: TCP}
+            resources: &resources
+              # Whole host. Request = limit reserves the 384 GiB host KV store share, the engine's
+              # workers (~210 GiB with TCMALLOC_AGGRESSIVE_DECOMMIT) and /dev/shm.
+              requests: {cpu: "64", memory: 850Gi, google.com/tpu: "4"}
+              limits: {memory: 850Gi, google.com/tpu: "4"}
+            # A cold start reads the ~420 GB per-host pre-shard and builds the kernels.
+            startupProbe:
+              httpGet: {path: /health, port: modelserver}
+              initialDelaySeconds: 60
+              periodSeconds: 30
+              timeoutSeconds: 5
+              failureThreshold: 240
+            livenessProbe:
+              httpGet: {path: /health, port: modelserver}
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            readinessProbe:
+              httpGet: {path: /v1/models, port: modelserver}
+              periodSeconds: 5
+              timeoutSeconds: 2
+              failureThreshold: 3
+            volumeMounts: &mounts
+              - {name: dshm, mountPath: /dev/shm}
+              - {name: models, mountPath: /models, readOnly: true}
+              - {name: launcher, mountPath: /opt/kimi-k3, readOnly: true}
+        volumes: &volumes
+          - name: dshm
+            emptyDir: {medium: Memory, sizeLimit: 64Gi}
+          - name: models
+            persistentVolumeClaim: {claimName: kimi-k3-models, readOnly: true}
+          - name: launcher
+            configMap: {name: megakernel}
+    workerTemplate:
+      metadata:
+        labels:
+          llm-d.ai/role: prefill
+      spec:
+        serviceAccountName: sa
+        terminationGracePeriodSeconds: 75
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu7x
+          cloud.google.com/gke-tpu-topology: 2x2x4
+        containers:
+          - name: modelserver
+            image: REPLACE_MODEL_SERVER_IMAGE
+            command: ["/bin/bash", "/opt/kimi-k3/serve-megakernel.sh"]
+            env: *prefill-env
+            envFrom: *common-env
+            resources: *resources
+            volumeMounts: *mounts
+        volumes: *volumes

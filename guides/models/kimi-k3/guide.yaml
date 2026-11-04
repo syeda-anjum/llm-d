@@ -14,7 +14,9 @@ support:
       notes: >-
         GKE only · Torch TPU vLLM · 1 LeaderWorkerSet replica on a `tpu7x` `2x2x4` slice (4 hosts × 4 chips): TP=8 × DP=4 × EP=32,
         one data-parallel rank per host, each serving its own endpoint (vLLM external DP load balancing) ·
-        fp8 KV cache, 262k context, 256 GiB host-DRAM KV tier per rank (`TPURaidenOffloadingConnector`) · weights on a ReadOnlyMany Hyperdisk ML volume hydrated from GCS
+        fp8 KV cache, 262k context, 256 GiB host-DRAM KV tier per rank (`TPURaidenOffloadingConnector`) ·
+        `TOPOLOGY=disaggregated`: megakernel backend P/D, 1 prefill + 1 decode LeaderWorkerSet, each TP=32 × DCP=32 on its own `2x2x4` slice, 1.5 TiB host KV store per role ·
+        weights on a ReadOnlyMany Hyperdisk ML volume hydrated from GCS
       model: moonshotai/Kimi-K3
       engines: {vllm: community}
 
@@ -32,6 +34,8 @@ env:
 
     ACCELERATOR_TYPE: {default: tpu, values: [tpu]}
     MODEL_SERVER: {default: vllm, values: [vllm]}
+    # unified: TP=8 x DP=4 pool with a host KV tier per rank (default); disaggregated: megakernel P/D on two 2x2x4 slices
+    TOPOLOGY: {default: unified, values: [unified, disaggregated]}
 
     MODEL: {default: "moonshotai/Kimi-K3", comment: "the served model name"}
     # GCS bucket holding the moonshotai/ copy that hydrates the model volume.
@@ -128,9 +132,17 @@ prerequisites:
 
 deploy:
   router_values:
-    - run: |
-        export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
-        export ROUTER_VALUES="${REPO_ROOT}/guides/models/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml"
+    unified:
+      - when: {TOPOLOGY: [unified]}
+        run: |
+          export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
+          export ROUTER_VALUES="${REPO_ROOT}/guides/models/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml"
+    disaggregated:
+      - when: {TOPOLOGY: [disaggregated]}
+        skip_in: [ci]
+        run: |
+          export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
+          export ROUTER_VALUES="${REPO_ROOT}/guides/models/${GUIDE_NAME}/router/${GUIDE_NAME}-disagg.values.yaml"
 
   monitoring_values:
     - when: {MONITORING: ["true"]}
@@ -146,9 +158,17 @@ deploy:
           -n ${NAMESPACE} --version ${ROUTER_CHART_VERSION}
 
   modelserver:
-    - run: |
-        kubectl apply -n ${NAMESPACE} \
-          -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/
+    unified:
+      - when: {TOPOLOGY: [unified]}
+        run: |
+          kubectl apply -n ${NAMESPACE} \
+            -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/
+    disaggregated:
+      - when: {TOPOLOGY: [disaggregated]}
+        skip_in: [ci]
+        run: |
+          kubectl apply -n ${NAMESPACE} \
+            -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}-disaggregated/
 
   monitoring:
     - when: {MONITORING: ["true"]}
@@ -182,7 +202,13 @@ verify:
 
 cleanup:
   modelserver:
-    - run: kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/
+    unified:
+      - when: {TOPOLOGY: [unified]}
+        run: kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/
+    disaggregated:
+      - when: {TOPOLOGY: [disaggregated]}
+        skip_in: [ci]
+        run: kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}-disaggregated/
   rest:
     - run: helm uninstall ${GUIDE_NAME} -n ${NAMESPACE}
     - run: kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/recipes/modelserver/components/monitoring --ignore-not-found=true

@@ -1,0 +1,60 @@
+## Kimi-K3 (TPU v7x, TOPOLOGY=disaggregated) guide overrides for the llm-d router.
+## Layer on top of: recipes/router/base.values.yaml
+##
+## Megakernel P/D: every request is disaggregated. The prefill profile prefers the prefill
+## engine that already holds the prompt's prefix (HBM or its host KV store) and balances token
+## load; the decode profile balances active requests. The decode leader's routing sidecar runs
+## the prefill hop and hands the KV transfer parameters to the decode engine. Only the role
+## leaders carry llm-d.ai/inference-serving, so headless ranks are never selected.
+router:
+  extraServicePorts:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8081
+
+  epp:
+    pluginsConfigFile: "kimi-k3-pd-plugins.yaml"
+    pluginsCustomConfig:
+      kimi-k3-pd-plugins.yaml: |
+        apiVersion: llm-d.ai/v1
+        kind: EndpointPickerConfig
+        plugins:
+        - type: always-disagg-pd-decider
+        - type: disagg-profile-handler
+          parameters:
+            deciders:
+              prefill: always-disagg-pd-decider
+        - type: prefill-filter
+        - type: decode-filter
+        - type: approx-prefix-cache-producer
+          parameters:
+            # Under DCP=32 a logical KV block is 32 x --block-size 512 = 16,384 tokens, the
+            # granularity at which the prefill reuses a cached prefix.
+            blockSizeTokens: 16384
+            maxPrefixTokensToMatch: 1048576
+            # autoTune counts HBM blocks only (llm-d-router#1650); the prefill's 1.5 TiB host
+            # store holds far more. Sized generously for the host tier, not calibrated.
+            autoTune: false
+            lruCapacityPerServer: 100000
+        - type: prefix-cache-scorer
+        - type: token-load-scorer
+        - type: inflight-load-producer
+        - type: active-request-scorer
+        schedulingProfiles:
+        - name: prefill
+          plugins:
+          - pluginRef: prefill-filter
+          - pluginRef: prefix-cache-scorer
+            weight: 3
+          - pluginRef: token-load-scorer
+            weight: 1
+        - name: decode
+          plugins:
+          - pluginRef: decode-filter
+          - pluginRef: active-request-scorer
+
+  modelServers:
+    matchLabels:
+      llm-d.ai/guide: "kimi-k3"
+      llm-d.ai/inference-serving: "true"

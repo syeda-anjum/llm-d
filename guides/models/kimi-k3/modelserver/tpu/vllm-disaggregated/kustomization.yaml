@@ -1,0 +1,46 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# TOPOLOGY=disaggregated: Kimi-K3 P/D on the vllm-torchtpu megakernel backend, 1 prefill + 1
+# decode LeaderWorkerSet, each TP=32 x DCP=32 on its own tpu7x 2x2x4 slice, with a host-DRAM KV
+# store on both roles. See serve-megakernel.sh.
+resources:
+  - ../../../../../recipes/modelserver/common
+  - lws-prefill.yaml
+  - lws-decode.yaml
+
+namePrefix: kimi-k3-tpu-vllm-
+
+configurations:
+  - namereference.yaml
+
+configMapGenerator:
+  - name: megakernel
+    files:
+      - serve-megakernel.sh
+  - name: megakernel-env
+    envs:
+      - megakernel.env
+
+components:
+  - ../../../../../recipes/modelserver/components/images/routing-sidecar/nightly
+
+# The megakernel backend ships in a dedicated vllm-torchtpu build (branch inferact/k3-megakernel
+# at c78529c), pinned by digest.
+# TODO: move to components/images once a release image carries the megakernel backend.
+images:
+  - name: REPLACE_MODEL_SERVER_IMAGE
+    newName: docker.io/vllm/vllm-torchtpu
+    digest: sha256:c86637bddf84176f91154df5109f6f36d9bdfb59155ee7796cf9686eb2795945
+
+labels:
+  - pairs:
+      llm-d.ai/guide: kimi-k3
+      llm-d.ai/model: Kimi-K3
+      llm-d.ai/accelerator-variant: tpu
+      llm-d.ai/accelerator-vendor: google
+      llm-d.ai/backend: torch-tpu
+      llm-d.ai/engine-type: vllm
+    fields:
+      - {group: leaderworkerset.x-k8s.io, version: v1, kind: LeaderWorkerSet, path: metadata/labels, create: true}
+      - {group: leaderworkerset.x-k8s.io, version: v1, kind: LeaderWorkerSet, path: spec/leaderWorkerTemplate/leaderTemplate/metadata/labels, create: true}
+      - {group: leaderworkerset.x-k8s.io, version: v1, kind: LeaderWorkerSet, path: spec/leaderWorkerTemplate/workerTemplate/metadata/labels, create: true}

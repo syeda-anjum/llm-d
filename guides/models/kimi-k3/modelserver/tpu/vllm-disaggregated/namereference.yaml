@@ -1,0 +1,12 @@
+# Let namePrefix/nameSuffix and the ConfigMap hash suffix follow into LeaderWorkerSet pod templates.
+nameReference:
+  - kind: ServiceAccount
+    fieldSpecs:
+      - {path: spec/leaderWorkerTemplate/leaderTemplate/spec/serviceAccountName, kind: LeaderWorkerSet}
+      - {path: spec/leaderWorkerTemplate/workerTemplate/spec/serviceAccountName, kind: LeaderWorkerSet}
+  - kind: ConfigMap
+    fieldSpecs:
+      - {path: spec/leaderWorkerTemplate/leaderTemplate/spec/volumes/configMap/name, kind: LeaderWorkerSet}
+      - {path: spec/leaderWorkerTemplate/workerTemplate/spec/volumes/configMap/name, kind: LeaderWorkerSet}
+      - {path: spec/leaderWorkerTemplate/leaderTemplate/spec/containers/envFrom/configMapRef/name, kind: LeaderWorkerSet}
+      - {path: spec/leaderWorkerTemplate/workerTemplate/spec/containers/envFrom/configMapRef/name, kind: LeaderWorkerSet}

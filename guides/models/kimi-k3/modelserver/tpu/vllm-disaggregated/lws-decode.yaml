@@ -1,0 +1,116 @@
+# Decode role of the Kimi-K3 megakernel P/D pair; see lws-prefill.yaml.
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: decode
+  labels:
+    llm-d.ai/role: decode
+  annotations:
+    leaderworkerset.sigs.k8s.io/exclusive-topology: "cloud.google.com/gke-nodepool"
+spec:
+  replicas: 1
+  rolloutStrategy:
+    type: RollingUpdate
+    rollingUpdateConfiguration: {maxSurge: 0, maxUnavailable: 1}
+  leaderWorkerTemplate:
+    size: 4
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          llm-d.ai/role: decode
+          llm-d.ai/inference-serving: "true"
+      spec:
+        serviceAccountName: sa
+        terminationGracePeriodSeconds: 75
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu7x
+          cloud.google.com/gke-tpu-topology: 2x2x4
+        initContainers:
+          # Routing sidecar on :8000: runs the prefill hop the router picked, then hands the
+          # request with its kv_transfer_params to the decode engine on :8200.
+          - name: routing-proxy
+            image: REPLACE_ROUTING_SIDECAR_IMAGE
+            imagePullPolicy: Always
+            args:
+              - --port=8000
+              - --vllm-port=8200
+              - --kv-connector=nixlv2
+              - --zap-log-level=1
+              - --secure-serving=false
+            ports:
+              - {name: sidecar, containerPort: 8000, protocol: TCP}
+            restartPolicy: Always
+            securityContext:
+              allowPrivilegeEscalation: false
+              runAsNonRoot: true
+        containers:
+          - name: modelserver
+            image: REPLACE_MODEL_SERVER_IMAGE
+            command: ["/bin/bash", "/opt/kimi-k3/serve-megakernel.sh"]
+            lifecycle:
+              preStop:
+                exec:
+                  command: ["/bin/sleep", "15"]
+            env: &decode-env
+              - {name: ROLE, value: decode}
+              - {name: HOST_KV_BYTES, value: "1649267441664"}
+              - {name: OFFLOAD_CONTROLLER_PORT, value: "28800"}
+              # Decode slots; the router and the agentic workload decide how many are busy.
+              - {name: MAX_NUM_SEQS, value: "64"}
+              - {name: TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT, value: "0"}
+              - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+            envFrom: &common-env
+              - configMapRef:
+                  name: megakernel-env
+            ports:
+              - {name: modelserver, containerPort: 8200, protocol: TCP}
+            resources: &resources
+              requests: {cpu: "64", memory: 850Gi, google.com/tpu: "4"}
+              limits: {memory: 850Gi, google.com/tpu: "4"}
+            startupProbe:
+              httpGet: {path: /health, port: modelserver}
+              initialDelaySeconds: 60
+              periodSeconds: 30
+              timeoutSeconds: 5
+              failureThreshold: 240
+            livenessProbe:
+              httpGet: {path: /health, port: modelserver}
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            readinessProbe:
+              httpGet: {path: /v1/models, port: modelserver}
+              periodSeconds: 5
+              timeoutSeconds: 2
+              failureThreshold: 3
+            volumeMounts: &mounts
+              - {name: dshm, mountPath: /dev/shm}
+              - {name: models, mountPath: /models, readOnly: true}
+              - {name: launcher, mountPath: /opt/kimi-k3, readOnly: true}
+        volumes: &volumes
+          - name: dshm
+            emptyDir: {medium: Memory, sizeLimit: 64Gi}
+          - name: models
+            persistentVolumeClaim: {claimName: kimi-k3-models, readOnly: true}
+          - name: launcher
+            configMap: {name: megakernel}
+    workerTemplate:
+      metadata:
+        labels:
+          llm-d.ai/role: decode
+      spec:
+        serviceAccountName: sa
+        terminationGracePeriodSeconds: 75
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu7x
+          cloud.google.com/gke-tpu-topology: 2x2x4
+        containers:
+          - name: modelserver
+            image: REPLACE_MODEL_SERVER_IMAGE
+            command: ["/bin/bash", "/opt/kimi-k3/serve-megakernel.sh"]
+            env: *decode-env
+            envFrom: *common-env
+            resources: *resources
+            volumeMounts: *mounts
+        volumes: *volumes
