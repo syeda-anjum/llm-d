@@ -116,7 +116,7 @@ This guide includes configurations for the following accelerator and model serve
 | Accelerator | `ACCELERATOR_TYPE` | Served model | vLLM | SGLang | Notes |
 | --- | --- | --- | --- | --- | --- |
 | NVIDIA H200 | `gpu` | `zai-org/GLM-5.2-FP8` | 🟡 community | 🟡 community | P/D disaggregated wide-EP on 8-GPU nodes; needs an all-to-all RDMA fabric · vLLM: CoreWeave InfiniBand, default 8 nodes / 64 GPUs (`p3w2d1w2` + tiered KV offloading), 2 to 10 nodes by `DEPLOYMENT` · SGLang: GKE A3 Ultra RoCE, default 2 nodes / 16 GPUs (`p1w1d1w1`), 2 to 8 nodes by `DEPLOYMENT` |
-| Google TPU v7x | `tpu` | `zai-org/GLM-5.2-FP8` | 🟡 community | — | GKE only · Torch TPU vLLM · `DEPLOYMENT=tpu7x-2x2x2-dp16`: one aggregated LeaderWorkerSet on a `2x2x2` tpu7x slice (2 hosts × 4 chips, DP=16 × TP=1, EP, fp8 KV cache) · no P/D disaggregation |
+| Google TPU v7x | `tpu` | `zai-org/GLM-5.2-FP8` | 🟡 community | — | GKE only · Torch TPU vLLM · one aggregated LeaderWorkerSet on a `2x2x2` tpu7x slice (2 hosts × 4 chips, fp8 KV cache) · `DEPLOYMENT=tpu7x-2x2x2-tp16-dcp8` (default): one TP=16 engine with decode context parallelism (DCP=8), 1M context · `DEPLOYMENT=tpu7x-2x2x2-dp16`: DP=16 × TP=1, EP · no P/D disaggregation |
 
 ✅ validated: covered by a nightly E2E workflow · 🟡 community: maintained by the hardware vendor or community, not covered by nightly E2E · ❌ not supported: tracked in the linked issue · — no configuration.
 <!-- guide:support end -->
@@ -179,7 +179,7 @@ export MONITORING_VALUES=
 export ACCELERATOR_TYPE=gpu # options: gpu, tpu
 export MODEL_SERVER=vllm # options: vllm, sglang
 export ROUTING=approximate # options: approximate, precise
-export DEPLOYMENT=default # options: default, p1w1d1w1, p1w1d1w2, p1w2d1w2, p2w1d1w1, p2w1d1w1-precise, p2w1d1w2, p2w2d1w2, p2w2d2w2, p3w2d1w2, p3w2d2w2, tpu7x-2x2x2-dp16
+export DEPLOYMENT=default # options: default, p1w1d1w1, p1w1d1w2, p1w2d1w2, p2w1d1w1, p2w1d1w1-precise, p2w1d1w2, p2w2d1w2, p2w2d2w2, p3w2d1w2, p3w2d2w2, tpu7x-2x2x2-tp16-dcp8, tpu7x-2x2x2-dp16
 export MODEL=zai-org/GLM-5.2-FP8 # the model every deployment serves
 source ${REPO_ROOT}/guides/env.sh # defines GAIE_VERSION, ROUTER_CHART_VERSION, router chart URLs, and CURL_TEST_IMAGE
 ```
@@ -289,7 +289,7 @@ export DEPLOYMENT=p2w1d1w1-precise
 <details data-when="ACCELERATOR_TYPE=tpu">
 <summary><b>Google TPU v7x (aggregated)</b></summary>
 
-The TPU deployment is one aggregated DP=16 pool with no P/D disaggregation, so the wide-EP `DisaggregatedSet` plugins do not apply. [`glm-5-2-tpu.values.yaml`](router/glm-5-2-tpu.values.yaml) selects the TPU pods (`llm-d.ai/guide: glm-5-2-tpu`) and routes with `prefix-cache-affinity-filter` + `token-load-scorer`; it also sets `DEPLOYMENT=tpu7x-2x2x2-dp16`. `ROUTING` is ignored on TPU.
+The TPU deployment is one aggregated pool with no P/D disaggregation, so the wide-EP `DisaggregatedSet` plugins do not apply. [`glm-5-2-tpu.values.yaml`](router/glm-5-2-tpu.values.yaml) selects the TPU pods (`llm-d.ai/guide: glm-5-2-tpu`) and routes with `prefix-cache-affinity-filter` + `token-load-scorer`; it also sets `DEPLOYMENT=tpu7x-2x2x2-tp16-dcp8`. `ROUTING` is ignored on TPU.
 
 <!-- guide:deploy.router_values.tpu start -->
 <!-- variants:start -->
@@ -298,12 +298,12 @@ The TPU deployment is one aggregated DP=16 pool with no P/D disaggregation, so t
 
 <!-- llm-d-cicd:skip start -->
 ```bash
-# The TPU deployment is one aggregated DP=16 pool: prefix-cache affinity
+# The TPU deployment is one aggregated pool: prefix-cache affinity
 # and token-load scoring instead of the wide-EP P/D plugins
 export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
 export ROUTER_VALUES="${REPO_ROOT}/guides/models/${GUIDE_NAME}/router/${GUIDE_NAME}-tpu.values.yaml"
 export ROUTER_OVERRIDES_VALUES="${ROUTER_VALUES}"
-export DEPLOYMENT=tpu7x-2x2x2-dp16
+export DEPLOYMENT=tpu7x-2x2x2-tp16-dcp8
 ```
 <!-- llm-d-cicd:skip end -->
 
@@ -358,7 +358,8 @@ Do not deploy the vLLM and SGLang recipes in the same namespace: the InferencePo
 <details data-when="ACCELERATOR_TYPE=tpu">
 <summary><b>Google TPU v7x notes</b></summary>
 
-- `tpu7x-2x2x2-dp16` is a two-host LeaderWorkerSet on a `2x2x2` tpu7x slice (4 chips per host, 2 TensorCores per chip): `vllm serve zai-org/GLM-5.2-FP8 --data-parallel-size=16 --tensor-parallel-size=1 --enable-expert-parallel --kv-cache-dtype=fp8 --max-model-len=32768`, one API server on the leader (port 8000). It runs on the Torch TPU vLLM image (`torch-tpu-vllm` component).
+- `tpu7x-2x2x2-tp16-dcp8` (default) is a two-host LeaderWorkerSet on a `2x2x2` tpu7x slice (4 chips per host, 2 TensorCores per chip) running one engine across both hosts: `vllm serve zai-org/GLM-5.2-FP8 --tensor-parallel-size=16 --decode-context-parallel-size=8 --cp-kv-cache-interleave-size=4 --kv-cache-dtype=fp8 --max-model-len=1048576`, with `--nnodes=2` and the worker host started `--headless`. Attention heads are TP-sharded and the MLA KV cache is split by sequence position across the DCP ranks, so the slice serves one long-context KV pool and one API endpoint on the leader (port 8000). Decode context parallelism for GLM-5.2 needs Torch TPU vLLM `v0.33.0` or later, which this deployment pins.
+- `tpu7x-2x2x2-dp16` runs 16 independent DP engines (`--data-parallel-size=16 --tensor-parallel-size=1 --enable-expert-parallel --max-model-len=32768`) behind one API server on the leader (port 8000). It runs on the Torch TPU vLLM image (`torch-tpu-vllm` component).
 - GKE only (`INFRA_PROVIDER` does not apply): the slice needs a `2x2x2` tpu7x node pool, a boot disk of at least 1.5 TB on every host (each host downloads the full 756 GB FP8 checkpoint into `/var/cache/huggingface`, a `hostPath`, and must keep it above the kubelet eviction threshold).
 - `MONITORING=true` is GPU-only here; the PodMonitors scrape per-rank GPU ports.
 

@@ -1,0 +1,48 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../../../../../../recipes/modelserver/base/multi-host/default
+
+namePrefix: glm-5-2-tpu-vllm-
+
+components:
+  - ../../../../../../../recipes/modelserver/components/graceful-shutdown
+  - ../../../../../../../recipes/modelserver/components/images/torch-tpu-vllm/release
+
+labels:
+  - pairs:
+      llm-d.ai/guide: glm-5-2-tpu
+      llm-d.ai/model: GLM-5.2-FP8
+      llm-d.ai/accelerator-variant: tpu
+      llm-d.ai/accelerator-vendor: google
+      llm-d.ai/backend: torch-tpu
+    includeSelectors: true
+    includeTemplates: true
+    fields:
+      - group: leaderworkerset.x-k8s.io
+        version: v1
+        kind: LeaderWorkerSet
+        path: metadata/labels
+        create: true
+      - group: leaderworkerset.x-k8s.io
+        version: v1
+        kind: LeaderWorkerSet
+        path: spec/leaderWorkerTemplate/leaderTemplate/metadata/labels
+        create: true
+      - group: leaderworkerset.x-k8s.io
+        version: v1
+        kind: LeaderWorkerSet
+        path: spec/leaderWorkerTemplate/workerTemplate/metadata/labels
+        create: true
+# TODO(#TBD): drop once the shared torch-tpu-vllm/release component moves to
+# v0.33.0 or later. Decode context parallelism for GLM-5.2 needs v0.33.0.
+images:
+  - name: docker.io/vllm/vllm-torchtpu
+    newTag: v0.33.0
+patches:
+  - path: patch-vllm.yaml
+    target:
+      group: leaderworkerset.x-k8s.io
+      version: v1
+      kind: LeaderWorkerSet
+      name: decode

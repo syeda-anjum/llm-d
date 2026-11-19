@@ -1,0 +1,245 @@
+- op: add
+  path: /metadata/annotations
+  value:
+    leaderworkerset.sigs.k8s.io/exclusive-topology: "cloud.google.com/gke-nodepool"
+- op: add
+  path: /spec/leaderWorkerTemplate/leaderTemplate/metadata/labels/llm-d.ai~1inference-serving
+  value: "true"
+- op: add
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/terminationGracePeriodSeconds
+  value: 75
+- op: add
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/nodeSelector
+  value:
+    cloud.google.com/gke-tpu-accelerator: tpu7x
+    cloud.google.com/gke-tpu-topology: 2x2x2
+- op: add
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/containers/0/lifecycle
+  value:
+    preStop:
+      exec:
+        command: ["/bin/sleep", "15"]
+- op: replace
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/containers/0/command
+  value: ["/bin/bash", "-c"]
+- op: replace
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/containers/0/args
+  value:
+    - |
+      set -euo pipefail
+      # One TP=16 engine spans both hosts: attention heads are TP-sharded and
+      # the MLA KV cache is split by sequence position across DCP ranks, so the
+      # whole slice serves one long-context KV pool. Host 0 serves HTTP.
+      exec vllm serve zai-org/GLM-5.2-FP8 \
+        --tokenizer=zai-org/GLM-5.2-FP8 \
+        --tensor-parallel-size=16 \
+        --decode-context-parallel-size=8 \
+        --cp-kv-cache-interleave-size=4 \
+        --nnodes=2 \
+        --master-addr=${LWS_LEADER_ADDRESS} \
+        --master-port=29500 \
+        --max-model-len=1048576 \
+        --kv-cache-dtype=fp8 \
+        --gpu-memory-utilization=0.9 \
+        --enable-prefix-caching \
+        --enable-auto-tool-choice \
+        --tool-call-parser=glm47 \
+        --reasoning-parser=glm45 \
+        --safetensors-load-strategy=prefetch \
+        --async-scheduling \
+        --disable-access-log-for-endpoints=/health,/metrics,/v1/models \
+        --shutdown-timeout=45 \
+        --node-rank=0 \
+        --host=0.0.0.0 \
+        --port=8000
+- op: replace
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/containers/0/env
+  value:
+    # Drop the checkpoint's page cache once weights are in HBM (frees host RAM).
+    - name: TPU_EVICT_WEIGHTS_PAGE_CACHE
+      value: "1"
+    # Node-local HuggingFace cache (hostPath), shared across pods and restarts.
+    - name: HF_HOME
+      value: /root/.cache/huggingface
+    - name: VLLM_ENGINE_READY_TIMEOUT_S
+      value: "3600"
+    - name: TPU_MULTIHOST_BACKEND
+      value: "mp"
+    # Merge DCP partial attention with one all-to-all on small decode steps,
+    # and bound per-rank sparse-MLA top-k (exact overflow pass inside the kernel).
+    - name: TPU_DCP_LSE_MERGE_A2A
+      value: "1"
+    - name: TPU_DCP_MLA_TOPK_CAP
+      value: "512"
+    - name: JAX_PLATFORMS
+      value: ""
+    - name: PJRT_DEVICE
+      value: "TPU"
+    - name: VLLM_TARGET_DEVICE
+      value: "tpu"
+    - name: VLLM_USE_BREAKABLE_CUDAGRAPH
+      value: "0"
+    - name: VLLM_USE_AOT_COMPILE
+      value: "0"
+    - name: TORCHINDUCTOR_AUTOGRAD_CACHE
+      value: "0"
+    - name: TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS
+      value: "false"
+    - name: HF_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: llm-d-hf-token
+          key: HF_TOKEN
+          optional: true
+- op: add
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/containers/0/resources
+  value:
+    limits:
+      google.com/tpu: 4
+    requests:
+      google.com/tpu: 4
+- op: add
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/containers/0/startupProbe
+  value:
+    httpGet:
+      path: /v1/models
+      port: modelserver
+    initialDelaySeconds: 15
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 120
+- op: add
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/containers/0/livenessProbe
+  value:
+    httpGet:
+      path: /health
+      port: modelserver
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+- op: add
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/containers/0/readinessProbe
+  value:
+    httpGet:
+      path: /v1/models
+      port: modelserver
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+- op: add
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/containers/0/volumeMounts
+  value:
+    - mountPath: /dev/shm
+      name: dshm
+    - mountPath: /root/.cache/huggingface
+      name: huggingface-cache
+- op: add
+  path: /spec/leaderWorkerTemplate/leaderTemplate/spec/volumes
+  value:
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 128Gi
+    - name: huggingface-cache
+      hostPath:
+        path: /var/cache/huggingface
+        type: DirectoryOrCreate
+- op: add
+  path: /spec/leaderWorkerTemplate/workerTemplate/spec/nodeSelector
+  value:
+    cloud.google.com/gke-tpu-accelerator: tpu7x
+    cloud.google.com/gke-tpu-topology: 2x2x2
+- op: replace
+  path: /spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/command
+  value: ["/bin/bash", "-c"]
+- op: replace
+  path: /spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/args
+  value:
+    - |
+      set -euo pipefail
+      # Host 1 runs the remaining TP ranks of the same engine and serves no HTTP.
+      exec vllm serve zai-org/GLM-5.2-FP8 \
+        --tokenizer=zai-org/GLM-5.2-FP8 \
+        --tensor-parallel-size=16 \
+        --decode-context-parallel-size=8 \
+        --cp-kv-cache-interleave-size=4 \
+        --nnodes=2 \
+        --master-addr=${LWS_LEADER_ADDRESS} \
+        --master-port=29500 \
+        --max-model-len=1048576 \
+        --kv-cache-dtype=fp8 \
+        --gpu-memory-utilization=0.9 \
+        --enable-prefix-caching \
+        --enable-auto-tool-choice \
+        --tool-call-parser=glm47 \
+        --reasoning-parser=glm45 \
+        --safetensors-load-strategy=prefetch \
+        --async-scheduling \
+        --disable-access-log-for-endpoints=/health,/metrics,/v1/models \
+        --shutdown-timeout=45 \
+        --node-rank=1 \
+        --headless
+- op: replace
+  path: /spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env
+  value:
+    # Drop the checkpoint's page cache once weights are in HBM (frees host RAM).
+    - name: TPU_EVICT_WEIGHTS_PAGE_CACHE
+      value: "1"
+    # Node-local HuggingFace cache (hostPath), shared across pods and restarts.
+    - name: HF_HOME
+      value: /root/.cache/huggingface
+    - name: VLLM_ENGINE_READY_TIMEOUT_S
+      value: "3600"
+    - name: TPU_MULTIHOST_BACKEND
+      value: "mp"
+    # Merge DCP partial attention with one all-to-all on small decode steps,
+    # and bound per-rank sparse-MLA top-k (exact overflow pass inside the kernel).
+    - name: TPU_DCP_LSE_MERGE_A2A
+      value: "1"
+    - name: TPU_DCP_MLA_TOPK_CAP
+      value: "512"
+    - name: JAX_PLATFORMS
+      value: ""
+    - name: PJRT_DEVICE
+      value: "TPU"
+    - name: VLLM_TARGET_DEVICE
+      value: "tpu"
+    - name: VLLM_USE_BREAKABLE_CUDAGRAPH
+      value: "0"
+    - name: VLLM_USE_AOT_COMPILE
+      value: "0"
+    - name: TORCHINDUCTOR_AUTOGRAD_CACHE
+      value: "0"
+    - name: TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS
+      value: "false"
+    - name: HF_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: llm-d-hf-token
+          key: HF_TOKEN
+          optional: true
+- op: add
+  path: /spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/resources
+  value:
+    limits:
+      google.com/tpu: 4
+    requests:
+      google.com/tpu: 4
+- op: add
+  path: /spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/volumeMounts
+  value:
+    - mountPath: /dev/shm
+      name: dshm
+    - mountPath: /root/.cache/huggingface
+      name: huggingface-cache
+- op: add
+  path: /spec/leaderWorkerTemplate/workerTemplate/spec/volumes
+  value:
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 128Gi
+    - name: huggingface-cache
+      hostPath:
+        path: /var/cache/huggingface
+        type: DirectoryOrCreate

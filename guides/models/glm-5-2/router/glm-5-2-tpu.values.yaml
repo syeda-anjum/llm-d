@@ -1,6 +1,6 @@
 ## GLM-5.2-FP8 on Google TPU 7x (Torch TPU vLLM) router values.
 ##
-## The TPU deployment is a single aggregated DP=16 LeaderWorkerSet (no P/D
+## The TPU deployments are single aggregated LeaderWorkerSets (no P/D
 ## disaggregation), so the wide-EP DisaggregatedSet plugins in
 ## glm-5-2.values.yaml do not apply. This file replaces them with prefix-cache
 ## affinity + token-load scoring against the TPU pods, selected by the
@@ -24,8 +24,11 @@ router:
         - type: inflight-load-producer
         - type: approx-prefix-cache-producer
           parameters:
-            maxPrefixTokensToMatch: 32768
-            blockSizeTokens: 256
+            # Covers the 1M-token context of tpu7x-2x2x2-tp16-dcp8.
+            maxPrefixTokensToMatch: 1048576
+            # Keep equal to the block_size the engine reports in
+            # vllm:cache_config_info.
+            blockSizeTokens: 1024
         - type: prefix-cache-affinity-filter
         schedulingProfiles:
         - name: default
